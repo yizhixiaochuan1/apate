@@ -2,174 +2,212 @@ namespace apate
 {
     public partial class ApateUI : Form
     {
-        private byte[] maskBytes = new byte[] { };
+        private byte[] maskBytes = Array.Empty<byte>();
         private string maskExtension = "";
-        //private string maskFilePath;
+        private bool busy;
+        private CancellationTokenSource? cancellation;
+        private readonly ToolStripStatusLabel cancelLink = new("取消") { IsLink = true, Visible = false };
+        private readonly ToolStripStatusLabel detailsLink = new("查看失败详情") { IsLink = true, Visible = false };
+        private readonly ToolStripProgressBar progressBar = new() { Visible = false, Width = 100 };
+        private List<string> lastErrors = new();
+
         public ApateUI()
         {
             InitializeComponent();
             ModeSelect(ModeEnum.OneKey);
+            toolStripStatusLabel1.Spring = true;
+            toolStripStatusLabel1.TextAlign = ContentAlignment.MiddleLeft;
+            toolStripStatusLabel1.AutoToolTip = true;
+            statusStrip1.ShowItemToolTips = true;
+            var legacyItem = new ToolStripMenuItem("还原旧版文件…");
+            legacyItem.Click += RevealLegacy_Click;
+            选项ToolStripMenuItem.DropDownItems.Insert(0, legacyItem);
+            选项ToolStripMenuItem.DropDownItems.Insert(1, new ToolStripSeparator());
+            statusStrip1.Items.AddRange(new ToolStripItem[] { progressBar, cancelLink, detailsLink });
+            cancelLink.Click += (_, _) =>
+            {
+                cancellation?.Cancel();
+                toolStripStatusLabel1.Text = "正在取消，原文件会被保留…";
+            };
+            detailsLink.Click += (_, _) => ShowErrors();
+            FormClosing += (_, e) =>
+            {
+                if (!busy) return;
+                cancellation?.Cancel();
+                e.Cancel = true;
+                toolStripStatusLabel1.Text = "正在取消，完成后可关闭窗口…";
+            };
         }
 
-        private void 退出ToolStripMenuItem_Click(object sender, EventArgs e)
-        {
-            this.Dispose();
-        }
+        private void 退出ToolStripMenuItem_Click(object sender, EventArgs e) => Close();
 
         private void 关于ToolStripMenuItem_Click(object sender, EventArgs e)
         {
-            AboutUI aboutUI = new AboutUI();
-            //如果主窗口是置顶，则弹窗也置顶
-            if (TopMost == true)
-            {
-                aboutUI.TopMost = true;
-            }
-            else
-            {
-                aboutUI.TopMost = false;
-            }
-            aboutUI.ShowDialog();
+            using var aboutUI = new AboutUI { TopMost = TopMost };
+            aboutUI.ShowDialog(this);
         }
 
-        private void MaskFileLabel_DragDrop(object sender, DragEventArgs e)
+        private static string[] DroppedPaths(DragEventArgs e) =>
+            e.Data?.GetData(DataFormats.FileDrop) as string[] ?? Array.Empty<string>();
+
+        private async void MaskFileLabel_DragDrop(object sender, DragEventArgs e)
         {
-            toolStripStatusLabel1.Text = "正在处理";
-            Array fileObjectArray = (Array)e.Data.GetData(DataFormats.FileDrop);
-            List<string> filePathList = new List<string>();
-            for (int i = 0; i < fileObjectArray.Length; i++)
+            if (busy) return;
+            ModeSelect(ModeEnum.Mask);
+            string[] paths = DroppedPaths(e);
+            if (paths.Length != 1 || Directory.Exists(paths[0]))
             {
-                filePathList.Add(fileObjectArray.GetValue(i).ToString());
-            }
-            if (filePathList.Count > 1)//如果拖入了多份文件
-            {
-                toolStripStatusLabel1.Text = "仅可拖入1份面具文件，请更换其他面具文件并重新拖入";
+                toolStripStatusLabel1.Text = "请拖入一个具有扩展名的面具文件。";
                 return;
             }
-            else if (Directory.Exists(filePathList[0]))//如果拖入的是文件夹
+            SetBusy(true);
+            toolStripStatusLabel1.Text = "正在读取面具…";
+            try
             {
-                toolStripStatusLabel1.Text = "不支持将文件夹作为面具，请更换其他面具文件并重新拖入";
-                return;
+                string extension = Path.GetExtension(paths[0]);
+                if (string.IsNullOrEmpty(extension) || extension == ".")
+                    throw new ArgumentException("面具文件必须具有扩展名。");
+                byte[] loaded = await Task.Run(() => FileTransformer.LoadMask(paths[0], cancellation!.Token));
+                maskBytes = loaded;
+                maskExtension = extension;
+                MaskFileDragLabel.Image = Properties.Resources.accept;
+                MaskFileDragLabel.Text = "";
+                TrueFileDragLabel.Image = Properties.Resources.drag;
+                TrueFileDragLabel.Text = "\r\n\r\n\r\n拖入\r\n进行伪装";
+                toolStripStatusLabel1.Text = "面具已载入，处理时会保留原文件。";
             }
-            if (new FileInfo(filePathList[0]).Length > Program.maximumMaskLength)//文件长度检测
+            catch (OperationCanceledException)
             {
-                toolStripStatusLabel1.Text = "面具文件过大，请更换其他面具文件（小于" + Program.maximumMaskLength / 1024 / 1024 + "MB）并重新拖入";
-                return;
+                toolStripStatusLabel1.Text = "已取消读取面具。";
             }
-            maskBytes = Program.FileToBytes(filePathList[0]);//将文件转换为字节数组
-            maskExtension = new FileInfo(filePathList[0]).Extension;//保存文件扩展名
+            catch (Exception ex)
+            {
+                toolStripStatusLabel1.Text = "面具读取失败：" + ex.Message;
+            }
+            finally
+            {
+                SetBusy(false);
+            }
+        }
+
+        private void MaskFileLabel_DragEnter(object sender, DragEventArgs e) => SetDragEffect(e);
+        private void TrueFileLabel_DragEnter(object sender, DragEventArgs e) => SetDragEffect(e);
+        private void RevealMaskLabel_DragEnter(object sender, DragEventArgs e) => SetDragEffect(e);
+
+        private void SetDragEffect(DragEventArgs e) =>
+            e.Effect = !busy && e.Data?.GetDataPresent(DataFormats.FileDrop) == true
+                ? DragDropEffects.Link : DragDropEffects.None;
+
+        private async void TrueFileLabel_DragDrop(object sender, DragEventArgs e)
+        {
+            if (busy) return;
             if (maskBytes.Length == 0)
             {
-                toolStripStatusLabel1.Text = "未知错误，请更换其他面具文件并重新拖入";
+                toolStripStatusLabel1.Text = "请先载入有效的面具文件。";
+                return;
             }
-            toolStripStatusLabel1.Text = "完成！";
-            //激活伪装区
-            MaskFileDragLabel.Image = Properties.Resources.accept;
-            MaskFileDragLabel.Text = "";
-            TrueFileDragLabel.AllowDrop = true;
-            TrueFileDragLabel.Image = Properties.Resources.drag;
-            TrueFileDragLabel.Text = "\r\n\r\n\r\n拖入\r\n进行伪装";
+            await RunBatchAsync(DroppedPaths(e), FileOperation.Disguise);
         }
 
-        private void MaskFileLabel_DragEnter(object sender, DragEventArgs e)
+        private async void RevealMaskLabel_DragDrop(object sender, DragEventArgs e)
         {
-            if (e.Data.GetDataPresent(DataFormats.FileDrop))
-                e.Effect = DragDropEffects.Link;
-            else
-                e.Effect = DragDropEffects.None;
+            if (!busy) await RunBatchAsync(DroppedPaths(e), FileOperation.Reveal);
         }
 
-        private void TrueFileLabel_DragDrop(object sender, DragEventArgs e)
+        private async void RevealLegacy_Click(object? sender, EventArgs e)
         {
-            toolStripStatusLabel1.Text = "正在处理";
-            Array fileObjectArray = (Array)e.Data.GetData(DataFormats.FileDrop);
-            List<string> filePathList = new List<string>();
-            for (int i = 0; i < fileObjectArray.Length; i++)
+            if (busy) return;
+            using var dialog = new OpenFileDialog
             {
-                filePathList.AddRange(Program.GetAllFilesRecursively(fileObjectArray.GetValue(i).ToString()));//递归遍历文件夹，并将文件添加到filePathList
-            }
-
-
-            if (maskBytes.Length > 0)//如果面具文件有效
-            {
-                int successCount = 0;
-                int failCount = 0;
-                for (int i = 0; i < filePathList.Count; i++)
-                {
-
-                    if (Program.Disguise(filePathList[i], maskBytes) == 1)//如果伪装成功
-                    {
-                        successCount++;
-                        File.Move(filePathList[i], filePathList[i] + maskExtension);
-                    }
-                    else//如果伪装失败
-                    {
-                        failCount++;
-
-                    }
-                }
-                toolStripStatusLabel1.Text = "完成！成功" + successCount + "个，失败" + failCount + "个";
-            }
-            else
-            {
-                toolStripStatusLabel1.Text = "尚未拖入面具文件";
-            }
+                Title = "选择确定由 v1.4.2 或更早版本伪装的文件",
+                Multiselect = true,
+                CheckFileExists = true
+            };
+            if (dialog.ShowDialog(this) != DialogResult.OK) return;
+            if (MessageBox.Show(this,
+                "旧版文件没有可验证的格式标识，无法确认文件身份或完整性。\r\n请仅选择确定由旧版 apate 伪装的文件。还原会保留原件，输出结果需自行核对。\r\n是否继续？",
+                "旧版兼容还原", MessageBoxButtons.YesNo, MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+            await RunBatchAsync(dialog.FileNames, FileOperation.RevealLegacy);
         }
 
-        private void TrueFileLabel_DragEnter(object sender, DragEventArgs e)
+        private async Task RunBatchAsync(string[] paths, FileOperation operation)
         {
-            if (e.Data.GetDataPresent(DataFormats.FileDrop))
-                e.Effect = DragDropEffects.Link;
-            else
-                e.Effect = DragDropEffects.None;
-        }
-
-        private void RevealMaskLabel_DragDrop(object sender, DragEventArgs e)
-        {
-            Activate();
-            //弹窗确认
-            InfoBox infoBox = new InfoBox("注意！", "如果拖入未经过伪装的文件，可能会对该文件造成严重的数据破坏，且无法恢复！请务必做好备份！\r\n是否继续？");
-            //如果主窗口是置顶，则弹窗也置顶
-            if (TopMost == true)
+            if (busy || paths.Length == 0) return;
+            SetBusy(true);
+            lastErrors = new List<string>();
+            detailsLink.Visible = false;
+            toolStripStatusLabel1.Text = "正在收集文件，原文件会被保留…";
+            byte[] currentMask = maskBytes;
+            string currentExtension = maskExtension;
+            CancellationTokenSource currentCancellation = cancellation!;
+            var progress = new Progress<BatchProgress>(p =>
             {
-                infoBox.TopMost = true;
+                if (!busy || !ReferenceEquals(cancellation, currentCancellation)) return;
+                progressBar.Maximum = Math.Max(1, p.Total);
+                progressBar.Value = Math.Min(p.Completed, progressBar.Maximum);
+                toolStripStatusLabel1.Text = $"正在处理 {p.Completed}/{p.Total}：{p.Name}";
+            });
+            try
+            {
+                BatchResult result = await Task.Run(() => BatchProcessor.Run(paths, operation,
+                    currentMask, currentExtension, progress, currentCancellation.Token));
+                lastErrors = result.Errors;
+                toolStripStatusLabel1.Text = $"{(result.Cancelled ? "已取消" : "完成")}：成功 {result.Succeeded} 个，失败/跳过 {result.Errors.Count} 项；原件已保留";
+                detailsLink.Visible = lastErrors.Count > 0;
             }
-            else
+            catch (Exception ex)
             {
-                infoBox.TopMost = false;
+                lastErrors.Add(ex.Message);
+                detailsLink.Visible = true;
+                toolStripStatusLabel1.Text = "处理已停止，原件已保留：" + ex.Message;
             }
-            if (infoBox.ShowDialog() == DialogResult.Yes)
+            finally
             {
-                toolStripStatusLabel1.Text = "正在处理";
-                Array fileObjectArray = (Array)e.Data.GetData(DataFormats.FileDrop);
-                List<string> filePathList = new List<string>();
-                for (int i = 0; i < fileObjectArray.Length; i++)
-                {
-                    filePathList.AddRange(Program.GetAllFilesRecursively(fileObjectArray.GetValue(i).ToString()));//递归遍历文件夹，并将文件添加到filePathList
-                }
-                int successCount = 0;
-                int failCount = 0;
-                for (int i = 0; i < filePathList.Count; i++)
-                {
-                    if (Program.Reveal(filePathList[i]) == 1)
-                    {
-                        successCount++;
-                        File.Move(filePathList[i], filePathList[i].Substring(0, filePathList[i].LastIndexOf('.')));
-                    }
-                    else
-                    {
-                        failCount++;
-                    }
-                }
-                toolStripStatusLabel1.Text = "完成！成功" + successCount + "个，失败" + failCount + "个";
+                SetBusy(false);
             }
         }
 
-        private void RevealMaskLabel_DragEnter(object sender, DragEventArgs e)
+        private void SetBusy(bool value)
         {
-            if (e.Data.GetDataPresent(DataFormats.FileDrop))
-                e.Effect = DragDropEffects.Link;
+            busy = value;
+            menuStrip1.Enabled = !value;
+            MaskFileDragLabel.AllowDrop = !value && 面具伪装ToolStripMenuItem.Checked;
+            TrueFileDragLabel.AllowDrop = !value && maskBytes.Length > 0;
+            RevealFileDragLabel.AllowDrop = !value;
+            cancelLink.Visible = value;
+            progressBar.Visible = value;
+            if (value)
+            {
+                cancellation = new CancellationTokenSource();
+                progressBar.Value = 0;
+            }
             else
-                e.Effect = DragDropEffects.None;
+            {
+                cancellation?.Dispose();
+                cancellation = null;
+            }
+        }
+
+        private void ShowErrors()
+        {
+            using var window = new Form
+            {
+                Text = "失败或跳过的文件",
+                StartPosition = FormStartPosition.CenterParent,
+                ClientSize = new Size(760, 400),
+                TopMost = TopMost
+            };
+            window.Controls.Add(new TextBox
+            {
+                Dock = DockStyle.Fill,
+                Multiline = true,
+                ReadOnly = true,
+                WordWrap = false,
+                ScrollBars = ScrollBars.Both,
+                Text = string.Join(Environment.NewLine + Environment.NewLine, lastErrors)
+            });
+            window.ShowDialog(this);
         }
 
         private void ModeSelect(ModeEnum mode)

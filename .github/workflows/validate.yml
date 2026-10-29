@@ -1,0 +1,35 @@
+name: Build and regression checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 6.0.x
+      - name: Run data-safety regression checks
+        run: dotnet run --project apate.Tests/apate.Tests.csproj --configuration Release
+      - name: Build Windows application
+        if: runner.os == 'Windows'
+        run: dotnet build apate/apate.csproj --configuration Release
+      - name: Publish Windows application
+        if: runner.os == 'Windows'
+        run: dotnet publish apate/apate.csproj --configuration Release --output artifacts/apate
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: apate-v1.5.0-windows
+          path: artifacts/apate/
+          if-no-files-found: error

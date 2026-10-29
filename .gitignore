@@ -1,3 +1,4 @@
-.vs
-apate/bin
-apate/obj
+.vs/
+**/bin/
+**/obj/
+*.user
